@@ -228,22 +228,24 @@ float sdfCircle(vec2 p, float r) {
   return length(p) - r;
 }
 
-// Distances to the nearest volcanic centre and the divide between neighbouring centres.
+// Distance to the nearest volcanic centre and the gaps to the next two centres.
 // Sample on the sphere so calderas stay round at the poles and rifts have no map seam.
-vec2 volcanicProvince(vec3 direction) {
+vec3 volcanicProvince(vec3 direction) {
   float nearest = 4.0;
   float second = 4.0;
+  float third = 4.0;
   for (int i = 0; i < 28; ++i) {
     float n = float(i);
     float y = 1.0 - 2.0 * (n + 0.5) / 28.0;
     float longitude = n * 2.399963 + seed;
     vec2 parallel = sqrt(1.0 - y * y) * vec2(cos(longitude), sin(longitude));
     float distanceSquared = 2.0 - 2.0 * dot(direction, vec3(parallel.x, y, parallel.y));
+    third = min(third, max(second, distanceSquared));
     second = min(second, max(nearest, distanceSquared));
     nearest = min(nearest, distanceSquared);
   }
   float radius = sqrt(max(0.0, nearest));
-  return vec2(radius, sqrt(max(0.0, second)) - radius);
+  return vec3(radius, sqrt(max(0.0, second)) - radius, sqrt(max(0.0, third)) - radius);
 }
 
 vec3 volcanicAtmosphere(float type) {
@@ -266,12 +268,16 @@ vec3 volcanicSurface(vec3 normal, float type, vec3 atmosphere) {
   float ridge = 1.0 - smoothstep(0.0, 0.19, abs(folds - 0.48));
 
   // A low-frequency winding channel. Convert the noise value to approximate surface
-  // distance using its tangent gradient, so bends and straights both have visible banks.
+  // distance using its tangent gradient. Keep the sign for pixel coverage across both banks.
   vec4 course = openSimplex2_Conventional(terrain * 0.84 + 8.0);
   vec3 slope = course.xyz - normal * dot(normal, course.xyz);
-  float riverDistance = abs(course.w) / max(1.6, 1.85 * length(slope));
-  float riverWidth = 0.027;
-  float lakeDepth = (0.37 - highland) * 0.65;
+  float riverDistance = course.w / max(0.1, 1.85 * length(slope));
+  float riverHalfWidth = 0.0024;
+  // Fill low, broad depressions. Fine folds roughen their shores without turning
+  // a long, narrow valley into a river-width band of lake pixels.
+  float basinFloor = 0.72 * openSimplex2_Conventional(terrain - 0.12 * warp).w
+                  + 0.28 * openSimplex2_Conventional(terrain * 2.2 + 4.5).w;
+  float lakeDepth = (-0.45 - basinFloor) * 0.30;
 
   vec3 lowRock, highRock, hot, ember;
   float height, deposits;
@@ -286,14 +292,14 @@ vec3 volcanicSurface(vec3 normal, float type, vec3 atmosphere) {
     ember = vec3(0.45, 0.042, 0.005);
   } else if (type < 0.50) {
     // Flat-floored calderas, raised rims and yellow mineral aprons on the outer slopes.
-    vec2 province = volcanicProvince(normalize(normal + 0.065 * warp));
+    vec3 province = volcanicProvince(normalize(normal + 0.065 * warp));
     float crater = province.x - (0.135 + 0.075 * warp.z);
     float rim = 1.0 - smoothstep(0.0, 0.085, abs(crater));
     float apron = 1.0 - smoothstep(0.03, 0.22, crater);
     height = 0.39 * rim + 0.24 * apron + 0.27 * highland + 0.10 * ridge;
     deposits = 0.56 * apron + 0.25 * ridge + 0.35 * highland;
     lakeDepth = max(lakeDepth * 0.65, -crater - 0.035 - 0.035 * warp.x);
-    riverWidth = 0.021;
+    riverHalfWidth = 0.0018;
     lowRock = vec3(0.14, 0.074, 0.037);
     highRock = vec3(0.82, 0.64, 0.25);
     hot = vec3(1.0, 0.27, 0.022);
@@ -303,18 +309,19 @@ vec3 volcanicSurface(vec3 normal, float type, vec3 atmosphere) {
     float massif = smoothstep(0.43, 0.66, highland);
     height = 0.20 * highland + massif * (0.36 + 0.44 * ridge);
     deposits = 0.12 * folds + massif * (0.25 + 0.60 * ridge);
-    lakeDepth = (0.335 - highland) * 0.7;
-    riverWidth = 0.027 * smoothstep(-0.30, 0.30, warp.x);
+    lakeDepth = (-0.54 - basinFloor) * 0.30;
+    riverHalfWidth = 0.0016;
     lowRock = vec3(0.019, 0.021, 0.025);
     highRock = vec3(0.39, 0.40, 0.42);
     hot = vec3(0.72, 0.11, 0.014);
     ember = vec3(0.24, 0.014, 0.004);
   } else {
     // Angular rafts of uplifted crust. Lava follows the faults and floods their low junctions.
-    vec2 province = volcanicProvince(normalize(normal + 0.066 * warp));
+    vec3 province = volcanicProvince(normalize(normal + 0.066 * warp));
     riverDistance = 0.5 * province.y;
-    riverWidth = 0.021;
-    lakeDepth = max((0.345 - highland) * 0.55, (province.x - 0.389) * 0.75);
+    riverHalfWidth = 0.0026;
+    // A three-way junction forms a pocket, while the fault between two plates stays thin.
+    lakeDepth = max((-0.53 - basinFloor) * 0.28, (0.055 + 0.04 * warp.x - province.z) * 0.8);
     float scarp = smoothstep(0.025, 0.075, riverDistance);
     height = 0.38 * scarp + 0.37 * highland + 0.22 * ridge;
     deposits = 0.37 * scarp + 0.37 * ridge + 0.30 * highland;
@@ -324,13 +331,18 @@ vec3 volcanicSurface(vec3 normal, float type, vec3 atmosphere) {
     ember = vec3(0.55, 0.042, 0.006);
   }
 
-  // Rivers widen on the basin floor and taper through high ground. Round the confluence
-  // so a channel opens into its lake through a continuous mouth.
-  float channelDepth = riverWidth * (1.65 - 1.35 * highland) - riverDistance;
-  float junction = max(0.0, 0.024 - abs(channelDepth - lakeDepth));
-  float depth = max(channelDepth, lakeDepth) + junction * junction / 0.096;
-  float pixel = max(fwidth(depth), 0.001);
-  float molten = smoothstep(-0.5 * pixel, 0.5 * pixel, depth);
+  // Channel widths are fractions of the planet radius. Even the widest is less than
+  // one pixel across on a 320 px disc. Only active stretches expose enough lava to see.
+  riverHalfWidth *= smoothstep(-0.06, 0.66, warp.y - 0.35 * (highland - 0.45));
+  float footprint = max(fwidth(riverDistance), 0.65 * length(fwidth(normal)));
+  footprint = max(footprint, 0.0001);
+  // Integrate the strip over a pixel. An unresolved channel contributes in proportion
+  // to its width, including when reduced quality renders fewer fragments.
+  float nearBank = clamp(0.5 + (abs(riverDistance) + riverHalfWidth) / footprint, 0.0, 1.0);
+  float farBank = clamp(0.5 + (abs(riverDistance) - riverHalfWidth) / footprint, 0.0, 1.0);
+  float riverCoverage = nearBank - farBank;
+  float lakePixel = max(fwidth(lakeDepth), 0.001);
+  float lakeCoverage = smoothstep(-0.5 * lakePixel, 0.5 * lakePixel, lakeDepth);
 
   vec3 light = normalize(light_direction);
   vec3 surfaceNormal = normal;
@@ -349,30 +361,34 @@ vec3 volcanicSurface(vec3 normal, float type, vec3 atmosphere) {
   rock *= mix(0.58, 1.25, ash);
   rock += highRock * ash * smoothstep(0.46, 0.72, folds) * 0.19;
   rock *= (0.70 + 0.65 * grain) * (0.025 + 0.98 * sun);
-  float bankGlow = exp(-max(0.0, -depth) * 150.0);
+  float bankGlow = exp(-max(0.0, -lakeDepth) * 220.0);
   rock += ember * 0.13 * bankGlow;
 
   // Cooler banks outline a broad incandescent interior. Streaks and cooling rafts
   // are confined to the liquid so they cannot break up the shoreline.
-  float interior = smoothstep(0.0, 0.046, depth);
+  float interior = smoothstep(0.0, 0.046, lakeDepth);
   float streak = smoothstep(0.33, 0.68, folds);
   vec3 lava = mix(ember, hot, (0.08 + 0.92 * interior) * (0.25 + 0.75 * streak));
   lava *= (0.75 + 0.25 * daylight) * (1.0 - 0.33 * interior * smoothstep(0.55, 0.69, grain));
-  vec3 color = mix(rock, lava, molten);
+  vec3 color = mix(rock, mix(ember, hot, 0.25), riverCoverage);
+  color = mix(color, lava, lakeCoverage);
   float rimLight = pow(1.0 - max(0.0, normal.z), 4.0) * max(0.0, dot(light, normal));
   return mix(color, atmosphere, 0.75 * rimLight);
 }
 
 vec3 DrawPlanet(vec2 pixelCoords, vec3 color, float planetRadius) {
   float d = sdfCircle(pixelCoords, planetRadius);
+  // Surface derivatives need the adjacent fragments even when they land just beyond
+  // the limb. Shading this margin makes tiny planets reproducible in system previews.
+  float derivativeMargin = length(fwidth(pixelCoords));
   if (d >= planetRadius * 0.05 + 24.0) return color;
 
   float type = fract(seed * 0.77341);
   vec3 atmosphere = volcanicAtmosphere(type);
-  if (d <= 0.0) {
+  if (d <= derivativeMargin) {
     vec2 xy = pixelCoords / planetRadius;
     vec3 normal = vec3(xy, sqrt(max(0.0, 1.0 - dot(xy, xy))));
-    vec3 planetColor = volcanicSurface(normal, type, atmosphere);
+    vec3 planetColor = volcanicSurface(normalize(normal), type, atmosphere);
     color = mix(color, planetColor, 1.0 - smoothstep(-1.0, 0.0, d));
   }
 
