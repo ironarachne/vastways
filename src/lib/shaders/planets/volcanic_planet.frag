@@ -5,8 +5,7 @@ precision highp float;
 uniform vec2 resolution;
 uniform float seed;
 uniform float render_background;
-// 1.0 draws the bump-normal pass, 0.0 skips it: six fbm evaluations a pixel, and by far the
-// most expensive thing in this shader. `reduced` quality drops it.
+// Full quality lights the relief of the crust. Reduced quality lights the smooth globe.
 uniform float bump_detail;
 uniform float planet_radius;
 uniform vec3 light_direction;
@@ -229,191 +228,159 @@ float sdfCircle(vec2 p, float r) {
   return length(p) - r;
 }
 
-float map(vec3 pos) {
-  return fbm(pos, 6, 0.5, 2.0, 4.0);
+// Distances to the nearest volcanic centre and the divide between neighbouring centres.
+// Sample on the sphere so calderas stay round at the poles and rifts have no map seam.
+vec2 volcanicProvince(vec3 direction) {
+  float nearest = 4.0;
+  float second = 4.0;
+  for (int i = 0; i < 28; ++i) {
+    float n = float(i);
+    float y = 1.0 - 2.0 * (n + 0.5) / 28.0;
+    float longitude = n * 2.399963 + seed;
+    vec2 parallel = sqrt(1.0 - y * y) * vec2(cos(longitude), sin(longitude));
+    float distanceSquared = 2.0 - 2.0 * dot(direction, vec3(parallel.x, y, parallel.y));
+    second = min(second, max(nearest, distanceSquared));
+    nearest = min(nearest, distanceSquared);
+  }
+  float radius = sqrt(max(0.0, nearest));
+  return vec2(radius, sqrt(max(0.0, second)) - radius);
 }
 
-vec3 calcNormal(vec3 pos) {
-  vec2 e = vec2(0.00015, 0.0);
-  return normalize(
-      vec3(
-          map(pos + e.xyy) - map(pos - e.xyy),
-          map(pos + e.yxy) - map(pos - e.yxy),
-          map(pos + e.yyx) - map(pos - e.yyx)
-      )
-  );
+vec3 volcanicAtmosphere(float type) {
+  if (type < 0.25) return vec3(0.50, 0.21, 0.09);
+  if (type < 0.50) return vec3(0.65, 0.44, 0.15);
+  if (type < 0.75) return vec3(0.29, 0.18, 0.17);
+  return vec3(0.57, 0.20, 0.10);
+}
+
+vec3 volcanicSurface(vec3 normal, float type, vec3 atmosphere) {
+  vec3 offset = seed * vec3(0.47, 0.83, 0.31);
+  vec3 p = normal * 2.1 + offset;
+  vec3 warp = vec3(openSimplex2_Conventional(p).w,
+                   openSimplex2_Conventional(p + 17.0).w,
+                   openSimplex2_Conventional(p - 9.0).w);
+  vec3 bent = normal + 0.13 * warp;
+  vec3 terrain = bent * 2.2 + offset;
+  float highland = fbm(terrain, 4, 0.44, 2.1, 1.0);
+  float folds = fbm(terrain * vec3(3.2, 8.0, 2.1), 3, 0.5, 2.1, 1.0);
+  float ridge = 1.0 - smoothstep(0.0, 0.19, abs(folds - 0.48));
+
+  // A low-frequency winding channel. Convert the noise value to approximate surface
+  // distance using its tangent gradient, so bends and straights both have visible banks.
+  vec4 course = openSimplex2_Conventional(terrain * 0.84 + 8.0);
+  vec3 slope = course.xyz - normal * dot(normal, course.xyz);
+  float riverDistance = abs(course.w) / max(1.6, 1.85 * length(slope));
+  float riverWidth = 0.027;
+  float lakeDepth = (0.37 - highland) * 0.65;
+
+  vec3 lowRock, highRock, hot, ember;
+  float height, deposits;
+  if (type < 0.25) {
+    // Overlapping basalt shelves. Ash picks out the ledges in successive cooled flows.
+    float shelf = smoothstep(0.40, 0.45, highland) + smoothstep(0.52, 0.57, highland);
+    height = 0.30 * shelf + 0.28 * highland + 0.12 * ridge;
+    deposits = 0.28 * shelf + 0.32 * ridge + 0.12 * folds;
+    lowRock = vec3(0.022, 0.018, 0.021);
+    highRock = vec3(0.32, 0.28, 0.26);
+    hot = vec3(1.0, 0.46, 0.046);
+    ember = vec3(0.45, 0.042, 0.005);
+  } else if (type < 0.50) {
+    // Flat-floored calderas, raised rims and yellow mineral aprons on the outer slopes.
+    vec2 province = volcanicProvince(normalize(normal + 0.065 * warp));
+    float crater = province.x - (0.135 + 0.075 * warp.z);
+    float rim = 1.0 - smoothstep(0.0, 0.085, abs(crater));
+    float apron = 1.0 - smoothstep(0.03, 0.22, crater);
+    height = 0.39 * rim + 0.24 * apron + 0.27 * highland + 0.10 * ridge;
+    deposits = 0.56 * apron + 0.25 * ridge + 0.35 * highland;
+    lakeDepth = max(lakeDepth * 0.65, -crater - 0.035 - 0.035 * warp.x);
+    riverWidth = 0.021;
+    lowRock = vec3(0.14, 0.074, 0.037);
+    highRock = vec3(0.82, 0.64, 0.25);
+    hot = vec3(1.0, 0.27, 0.022);
+    ember = vec3(0.48, 0.034, 0.005);
+  } else if (type < 0.75) {
+    // Isolated remnant massifs over a dark, solidified plain. Exposed crests catch pale ash.
+    float massif = smoothstep(0.43, 0.66, highland);
+    height = 0.20 * highland + massif * (0.36 + 0.44 * ridge);
+    deposits = 0.12 * folds + massif * (0.25 + 0.60 * ridge);
+    lakeDepth = (0.335 - highland) * 0.7;
+    riverWidth = 0.027 * smoothstep(-0.30, 0.30, warp.x);
+    lowRock = vec3(0.019, 0.021, 0.025);
+    highRock = vec3(0.39, 0.40, 0.42);
+    hot = vec3(0.72, 0.11, 0.014);
+    ember = vec3(0.24, 0.014, 0.004);
+  } else {
+    // Angular rafts of uplifted crust. Lava follows the faults and floods their low junctions.
+    vec2 province = volcanicProvince(normalize(normal + 0.066 * warp));
+    riverDistance = 0.5 * province.y;
+    riverWidth = 0.021;
+    lakeDepth = max((0.345 - highland) * 0.55, (province.x - 0.389) * 0.75);
+    float scarp = smoothstep(0.025, 0.075, riverDistance);
+    height = 0.38 * scarp + 0.37 * highland + 0.22 * ridge;
+    deposits = 0.37 * scarp + 0.37 * ridge + 0.30 * highland;
+    lowRock = vec3(0.052, 0.025, 0.024);
+    highRock = vec3(0.33, 0.26, 0.23);
+    hot = vec3(1.0, 0.32, 0.026);
+    ember = vec3(0.55, 0.042, 0.006);
+  }
+
+  // Rivers widen on the basin floor and taper through high ground. Round the confluence
+  // so a channel opens into its lake through a continuous mouth.
+  float channelDepth = riverWidth * (1.65 - 1.35 * highland) - riverDistance;
+  float junction = max(0.0, 0.024 - abs(channelDepth - lakeDepth));
+  float depth = max(channelDepth, lakeDepth) + junction * junction / 0.096;
+  float pixel = max(fwidth(depth), 0.001);
+  float molten = smoothstep(-0.5 * pixel, 0.5 * pixel, depth);
+
+  vec3 light = normalize(light_direction);
+  vec3 surfaceNormal = normal;
+  if (bump_detail > 0.5) {
+    // Derive relief from the actual shelves, rims and scarps used to colour this seed.
+    vec3 rockSurface = normal * (1.0 + 0.016 * height);
+    vec3 relief = cross(dFdx(rockSurface), dFdy(rockSurface));
+    surfaceNormal = normalize(normal + relief / max(length(relief), 0.000001));
+  }
+  float daylight = smoothstep(-0.12, 0.24, dot(light, normal));
+  float sun = daylight * max(0.0, dot(light, surfaceNormal));
+  float grain = fbm(terrain * 21.0, 2, 0.5, 2.0, 1.0);
+  vec3 rock = mix(lowRock, highRock, clamp(deposits * deposits, 0.0, 1.0));
+  // Pale striations collect on exposed high ground, leaving expanses of bare dark rock.
+  float ash = smoothstep(0.34, 0.67, highland + 0.15 * warp.y);
+  rock *= mix(0.58, 1.25, ash);
+  rock += highRock * ash * smoothstep(0.46, 0.72, folds) * 0.19;
+  rock *= (0.70 + 0.65 * grain) * (0.025 + 0.98 * sun);
+  float bankGlow = exp(-max(0.0, -depth) * 150.0);
+  rock += ember * 0.13 * bankGlow;
+
+  // Cooler banks outline a broad incandescent interior. Streaks and cooling rafts
+  // are confined to the liquid so they cannot break up the shoreline.
+  float interior = smoothstep(0.0, 0.046, depth);
+  float streak = smoothstep(0.33, 0.68, folds);
+  vec3 lava = mix(ember, hot, (0.08 + 0.92 * interior) * (0.25 + 0.75 * streak));
+  lava *= (0.75 + 0.25 * daylight) * (1.0 - 0.33 * interior * smoothstep(0.55, 0.69, grain));
+  vec3 color = mix(rock, lava, molten);
+  float rimLight = pow(1.0 - max(0.0, normal.z), 4.0) * max(0.0, dot(light, normal));
+  return mix(color, atmosphere, 0.75 * rimLight);
 }
 
 vec3 DrawPlanet(vec2 pixelCoords, vec3 color, float planetRadius) {
-  float pType = fract(seed * 0.77341);
-
-  // Palette 1: Basaltic (Mustafar-like: Black crust, bright orange/yellow lava)
-  vec3 v1_1 = vec3(1.00, 1.00, 0.00); // Hot yellow lava core
-  vec3 v1_2 = vec3(1.00, 0.30, 0.00); // Orange lava edge
-  vec3 l1_1 = vec3(0.15, 0.12, 0.10); // Dark grey basalt
-  vec3 l1_2 = vec3(0.05, 0.04, 0.03); // Jet black obsidian
-  vec3 c1   = vec3(0.20, 0.15, 0.15); // Dark ash clouds
-  vec3 f1   = vec3(0.80, 0.40, 0.10); // Ember orange atmosphere
-
-  // Palette 2: Sulfuric (Io-like: Yellow/green crust, angry red/orange lakes)
-  vec3 v2_1 = vec3(1.00, 0.60, 0.00); // Orange-yellow sulfur lava
-  vec3 v2_2 = vec3(0.80, 0.10, 0.00); // Deep red magma
-  vec3 l2_1 = vec3(0.70, 0.60, 0.20); // Yellow/green sulfur crust
-  vec3 l2_2 = vec3(0.40, 0.30, 0.10); // Brownish stained rock
-  vec3 c2   = vec3(0.60, 0.60, 0.40); // Yellowish sulfur dioxide clouds
-  vec3 f2   = vec3(0.90, 0.70, 0.20); // Yellow-gold atmosphere
-
-  // Palette 3: Cooling/Dying (Thick pitch black crust, dim deep red cracks)
-  vec3 v3_1 = vec3(0.60, 0.10, 0.00); // Cherry red lava
-  vec3 v3_2 = vec3(0.30, 0.02, 0.00); // Very dark cooling edge
-  vec3 l3_1 = vec3(0.10, 0.08, 0.10); // Cool grey rock
-  vec3 l3_2 = vec3(0.02, 0.02, 0.02); // Pitch black
-  vec3 c3   = vec3(0.10, 0.10, 0.10); // Very thin dark grey clouds
-  vec3 f3   = vec3(0.40, 0.05, 0.05); // Deep blood red atmosphere
-
-  // Palette 4: Cracking Lava (Dark brown/grey crust, angry red lava rivers)
-  vec3 v4_1 = vec3(1.00, 0.20, 0.00); // Bright red-orange core
-  vec3 v4_2 = vec3(0.60, 0.05, 0.00); // Deep angry red edge
-  vec3 l4_1 = vec3(0.25, 0.20, 0.18); // Dark brown crust
-  vec3 l4_2 = vec3(0.15, 0.12, 0.10); // Very dark brownish grey
-  vec3 c4   = vec3(0.20, 0.15, 0.15); // Dark ash
-  vec3 f4   = vec3(0.60, 0.10, 0.05); // Red atmospheric glow
-
-  vec3 vBase1 = v1_1; vec3 vBase2 = v1_2;
-  vec3 lBase1 = l1_1; vec3 lBase2 = l1_2;
-  vec3 cBase = c1; vec3 fBase = f1;
-
-  if (pType > 0.25) { vBase1 = mix(v1_1, v2_1, smoothstep(0.25, 0.35, pType)); vBase2 = mix(v1_2, v2_2, smoothstep(0.25, 0.35, pType)); lBase1 = mix(l1_1, l2_1, smoothstep(0.25, 0.35, pType)); lBase2 = mix(l1_2, l2_2, smoothstep(0.25, 0.35, pType)); cBase = mix(c1, c2, smoothstep(0.25, 0.35, pType)); fBase = mix(f1, f2, smoothstep(0.25, 0.35, pType)); }
-  if (pType > 0.50) { vBase1 = mix(v2_1, v3_1, smoothstep(0.50, 0.60, pType)); vBase2 = mix(v2_2, v3_2, smoothstep(0.50, 0.60, pType)); lBase1 = mix(l2_1, l3_1, smoothstep(0.50, 0.60, pType)); lBase2 = mix(l2_2, l3_2, smoothstep(0.50, 0.60, pType)); cBase = mix(c2, c3, smoothstep(0.50, 0.60, pType)); fBase = mix(f2, f3, smoothstep(0.50, 0.60, pType)); }
-  if (pType > 0.75) { vBase1 = mix(v3_1, v4_1, smoothstep(0.75, 0.85, pType)); vBase2 = mix(v3_2, v4_2, smoothstep(0.75, 0.85, pType)); lBase1 = mix(l3_1, l4_1, smoothstep(0.75, 0.85, pType)); lBase2 = mix(l3_2, l4_2, smoothstep(0.75, 0.85, pType)); cBase = mix(c3, c4, smoothstep(0.75, 0.85, pType)); fBase = mix(f3, f4, smoothstep(0.75, 0.85, pType)); }
-
   float d = sdfCircle(pixelCoords, planetRadius);
+  if (d >= planetRadius * 0.05 + 24.0) return color;
 
-  vec3 planetColor = vec3(1.0);
-
+  float type = fract(seed * 0.77341);
+  vec3 atmosphere = volcanicAtmosphere(type);
   if (d <= 0.0) {
-    float x = pixelCoords.x / planetRadius;
-    float y = pixelCoords.y / planetRadius;
-    float z = sqrt(max(0.0, 1.0 - x * x - y * y));
-
-    vec3 viewNormal = vec3(x, y, z);
-    vec3 wsPosition = viewNormal;
-    vec3 wsNormal = normalize(wsPosition);
-    vec3 wsViewDir = vec3(0.0, 0.0, 1.0);
-
-    vec3 noiseCoord = wsPosition * 2.0;
-    vec3 seededNoiseCoord = noiseCoord + seed / 100.0;
-    float noiseSample = fbm(seededNoiseCoord, 6, 0.5, 2.0, 4.0);
-
-    // Vary the lava lake size based on type
-    float lavaLakeSize = 0.02;
-    if (pType < 0.25) lavaLakeSize = 0.025; // Basaltic lakes
-    else if (pType < 0.50) lavaLakeSize = 0.035; // Sulfuric pools
-    else if (pType < 0.75) lavaLakeSize = 0.008; // Cooling tight cracks
-    else {
-      // Palette 4: Lava rivers. We create a "ridge" or "vein" pattern by taking the absolute value of noise.
-      float riverMap = abs(fbm(seededNoiseCoord * 1.5, 4, 0.5, 2.0, 1.0) - 0.5) * 2.0;
-      // We want lava where the river function is very low (the valley of the noise)
-      noiseSample = riverMap * 0.15; // remap it so smaller values trigger the lava
-      lavaLakeSize = 0.015;
-    }
-
-    // Coloring
-    vec3 lavaColor = mix(
-        vBase1,
-        vBase2,
-        smoothstep(0.001, lavaLakeSize, noiseSample));
-
-    vec3 landColor = mix(
-        lBase1,
-        lBase2,
-        smoothstep(0.1, 0.3, noiseSample));
-
-    // Swathes of dark soot/ash across the landscape
-    float ashMap = fbm(seededNoiseCoord * 3.0 + vec3(15.0), 3, 0.5, 2.0, 1.0);
-    landColor = mix(landColor, lBase2 * 0.5, smoothstep(0.6, 0.9, ashMap));
-
-    // Highlands
-    landColor = mix(landColor, lBase1 * 1.5, smoothstep(0.5, 0.7, noiseSample));
-
-    // Rough jagged crust around the lava lakes
-    landColor = mix(landColor, lBase2 * 0.3, smoothstep(lavaLakeSize, lavaLakeSize + 0.05, noiseSample));
-
-    // Base color of the planet
-    planetColor = mix(
-        lavaColor, landColor, smoothstep(lavaLakeSize - 0.01, lavaLakeSize, noiseSample));
-
-    // Lighting Math
-    vec2 specParams = mix(
-        vec2(0.5, 32.0),
-        vec2(0.01, 2.0),
-        smoothstep(0.05, 0.06, noiseSample));
-    vec3 wsLightDir = normalize(light_direction);
-    vec3 wsSurfaceNormal = bump_detail > 0.5 ? normalize(calcNormal(noiseCoord) + 16.0 * wsNormal) : wsNormal;
-
-    // Subsurface scattering & Light Intensity
-    float wrap = 0.05;
-    float dp = max(0.0, (dot(wsLightDir, wsSurfaceNormal) + wrap) / (1.0 + wrap));
-
-    vec3 lightColor = mix(
-        vec3(0.25, 0.0, 0.0),
-        vec3(0.75),
-        smoothstep(0.05, 0.5, dp));
-    vec3 ambient = vec3(0.005);
-    vec3 diffuse = lightColor * dp;
-
-    vec3 r = normalize(reflect(-wsLightDir, wsSurfaceNormal));
-    float phongValue = max(0.0, dot(wsViewDir, r));
-    phongValue = pow(phongValue, specParams.y);
-
-    vec3 specular = vec3(phongValue) * specParams.x * diffuse;
-
-    // Apply lighting only to land
-    vec3 planetShading = landColor * (diffuse + ambient) + specular;
-
-    // Smooth the lava glow on the dark side to make it realistic
-    // Instead of ignoring lighting entirely, lava dims when facing away from the sun but doesn't go black.
-    // Minimum lava brightness is around 30% of its daylight brightness to keep it glowing but realistic
-    float lavaGlowStrength = mix(0.3, 1.0, smoothstep(0.0, 0.5, dp));
-
-    // Add extra glow back into the crust from the lava itself near the edges
-    float crustGlow = smoothstep(lavaLakeSize + 0.1, lavaLakeSize - 0.02, noiseSample) * 0.5;
-    planetShading += crustGlow * lavaColor * lavaGlowStrength;
-
-    // Re-mix the lava back over the shaded planet using the masked strength
-    planetColor = mix(
-        lavaColor * lavaGlowStrength,
-        planetShading,
-        smoothstep(lavaLakeSize - 0.01, lavaLakeSize, noiseSample));
-
-    // Clouds (Ash/Smoke)
-    // Cloud density depends on the world type (Io has lots of sulfur clouds, cooling has very few)
-    float cloudAmount = mix(0.6, 0.9, ashMap);
-    float cloudMap = fbm(seededNoiseCoord * 0.35 + vec3(10.0), 6, 0.75, 2.0, 1.0);
-
-    // Volcanic clouds are patchy but dense
-    float cloudDensity = smoothstep(0.4, 0.7, cloudMap);
-
-    // Clouds catch underlying lava glow on the night side!
-    float cloudLavaGlow = smoothstep(lavaLakeSize + 0.15, lavaLakeSize - 0.05, noiseSample) * cloudDensity * 0.8;
-    vec3 illuminatedCloud = mix(cBase * (diffuse + ambient * 3.0), vBase2 * lavaGlowStrength, cloudLavaGlow);
-
-    planetColor = mix(
-        planetColor, illuminatedCloud, cloudDensity * cloudAmount);
-
-    // Fresnel (wrapping the atmospheric color around the horizon)
-    float fresnel = 1.0 - smoothstep(0.1, 1.0, viewNormal.z);
-    fresnel = pow(max(0.0, fresnel), 8.0) * dp; // Only light up the day-side edge
-    planetColor = mix(planetColor, fBase, fresnel);
+    vec2 xy = pixelCoords / planetRadius;
+    vec3 normal = vec3(xy, sqrt(max(0.0, 1.0 - dot(xy, xy))));
+    vec3 planetColor = volcanicSurface(normal, type, atmosphere);
+    color = mix(color, planetColor, 1.0 - smoothstep(-1.0, 0.0, d));
   }
-
-  color = mix(color, planetColor, 1.0 - smoothstep(-1.0, 0.0, d));
 
   // Atmosphere glow (halo outside the planet)
   float atmosphereAmount = planetRadius * 0.05;
   float atmosphereRadius = planetRadius + atmosphereAmount;
 
-  if (d < atmosphereAmount + 24.0 && d >= -1.0) {
+  if (d >= -1.0) {
     float x = pixelCoords.x / atmosphereRadius;
     float y = pixelCoords.y / atmosphereRadius;
     float z = sqrt(max(0.0, 1.0 - x * x - y * y));
@@ -425,7 +392,7 @@ vec3 DrawPlanet(vec2 pixelCoords, vec3 color, float planetRadius) {
     float glowDegree = -0.1;
     glowDegree *= 512.0 / resolution.x;
 
-    vec3 glowColor = fBase * exp(glowDegree * d * d) * lighting * 0.65;
+    vec3 glowColor = atmosphere * exp(glowDegree * d * d) * lighting * 0.65;
     color += glowColor;
   }
 
