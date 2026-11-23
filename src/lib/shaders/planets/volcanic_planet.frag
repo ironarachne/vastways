@@ -331,6 +331,21 @@ vec3 volcanicSurface(vec3 normal, float type, vec3 atmosphere) {
     ember = vec3(0.55, 0.042, 0.006);
   }
 
+  // Differential erosion along the shore: lava reaches inland through softer seams,
+  // while resistant ribs project into the basin. Work at the basin margin so
+  // caldera floors stay filled and the fine river mask keeps its orbital scale.
+  vec3 strata = bent * vec3(5.0, 10.0, 4.0) + offset + 0.35 * warp;
+  float bedding = openSimplex2_Conventional(strata).w;
+  float joint = openSimplex2_Conventional(strata * 1.9 + 12.0).w;
+  float exposedBed = bedding + 0.32 * joint;
+  float inlet = 1.0 - smoothstep(-0.55, 0.10, exposedBed);
+  float headland = smoothstep(0.02, 0.62, exposedBed) * (0.65 + 0.35 * ridge);
+  float shore = 1.0 - smoothstep(0.018, 0.078, abs(lakeDepth));
+  float reach = 0.70 + 0.30 * warp.z;
+  float wear = shore * reach * (0.043 * inlet - 0.032 * headland);
+  lakeDepth += wear;
+  height -= 1.6 * wear;
+
   // Channel widths are fractions of the planet radius. Even the widest is less than
   // one pixel across on a 320 px disc. Only active stretches expose enough lava to see.
   riverHalfWidth *= smoothstep(-0.06, 0.66, warp.y - 0.35 * (highland - 0.45));
